@@ -103,6 +103,8 @@ print(f" Máy chủ: {SERVER_URL}")
 print(f"==================================================\n")
 
 current_session = {}
+processed_files = set()
+processed_files_lock = threading.Lock()
 
 def wait_for_file_stable(file_path, stable_seconds=2.0, poll_interval=0.5, max_wait=30):
     """Wait until file size stops changing for stable_seconds.
@@ -137,12 +139,21 @@ def wait_for_file_stable(file_path, stable_seconds=2.0, poll_interval=0.5, max_w
 
 
 def process_and_upload(file_path, room_id, session_id):
+    # Lock check: Đảm bảo 1 file path chỉ được xử lý đúng 1 lần duy nhất
+    abs_path = os.path.abspath(file_path)
+    with processed_files_lock:
+        if abs_path in processed_files:
+            return
+        processed_files.add(abs_path)
+
     filename = os.path.basename(file_path)
     print(f"[>] Phát hiện file mới: {filename} — đang chờ ghi xong...")
 
     # ── BƯỚC 1: Chờ file ghi xong (File Stability Check) ──
     if not wait_for_file_stable(file_path):
         print(f"    [LỖI] File {filename} không ổn định hoặc đã biến mất. Bỏ qua.")
+        with processed_files_lock:
+            processed_files.discard(abs_path)
         return
 
     file_size_kb = os.path.getsize(file_path) / 1024
