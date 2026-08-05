@@ -103,7 +103,25 @@ print(f" Máy chủ: {SERVER_URL}")
 print(f"==================================================\n")
 
 current_session = {}
-processed_files = set()
+PROCESSED_DB_FILE = os.path.join(BASE_DIR, "processed_files.json")
+
+def load_processed_files():
+    if os.path.exists(PROCESSED_DB_FILE):
+        try:
+            with open(PROCESSED_DB_FILE, 'r', encoding='utf-8') as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+def save_processed_files():
+    try:
+        with open(PROCESSED_DB_FILE, 'w', encoding='utf-8') as f:
+            json.dump(list(processed_files), f, indent=2)
+    except Exception as e:
+        print(f"[CẢNH BÁO] Không thể lưu processed_files.json: {e}")
+
+processed_files = load_processed_files()
 processed_files_lock = threading.Lock()
 
 def wait_for_file_stable(file_path, stable_seconds=2.0, poll_interval=0.5, max_wait=30):
@@ -145,6 +163,7 @@ def process_and_upload(file_path, room_id, session_id):
         if abs_path in processed_files:
             return
         processed_files.add(abs_path)
+        save_processed_files()
 
     filename = os.path.basename(file_path)
     print(f"[>] Phát hiện file mới: {filename} — đang chờ ghi xong...")
@@ -154,6 +173,7 @@ def process_and_upload(file_path, room_id, session_id):
         print(f"    [LỖI] File {filename} không ổn định hoặc đã biến mất. Bỏ qua.")
         with processed_files_lock:
             processed_files.discard(abs_path)
+            save_processed_files()
         return
 
     file_size_kb = os.path.getsize(file_path) / 1024
