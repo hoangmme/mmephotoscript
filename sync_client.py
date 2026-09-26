@@ -336,6 +336,9 @@ def upload_to_r2(put_url, filename, data=None, file_path=None, content_type='app
 def make_thumbnail(file_path):
     from PIL import ImageOps
     with Image.open(file_path) as img:
+        # Với JPEG: giải mã thẳng ở 1/2, 1/4... độ phân giải (vẫn >= MAX_WIDTH mỗi chiều)
+        # thay vì giải mã đủ 24MP rồi mới thu nhỏ -> nhanh ~3 lần, đỡ CPU máy chụp
+        img.draft('RGB', (MAX_WIDTH, MAX_WIDTH))
         try:
             img = ImageOps.exif_transpose(img)
         except Exception:
