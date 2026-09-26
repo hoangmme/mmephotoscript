@@ -71,8 +71,8 @@ goto end
 
 :update
 echo [*] Dang dung sync_client.py de update...
-wmic process where "name='python.exe' and commandline like '%%sync_client.py%%'" call terminate >nul 2>&1
-wmic process where "name='wscript.exe' and commandline like '%%run_hidden.vbs%%'" call terminate >nul 2>&1
+call :kill_sync
+:: Dong nay giu nguyen do dai file de lenh 'mmephoto update' cua ban cu khong bi lech dong khi git pull                                                                                             
 
 echo [*] Dang lay code moi nhat tu Github...
 git pull
@@ -82,11 +82,10 @@ goto start
 
 :reset
 echo [*] Dang dung service...
-wmic process where "name='python.exe' and commandline like '%%sync_client.py%%'" call terminate >nul 2>&1
+call :kill_sync
 
 echo [*] Dang xoa cau hinh cu...
 if exist config.json del config.json
-if exist batch_history.json del batch_history.json
 
 echo [OK] Đã xóa config! Mo giao dien de ban dang ky lai phong...
 start cmd /k "python sync_client.py"
@@ -105,8 +104,7 @@ goto end
 
 :stop
 echo [*] Dang tat ngam sync_client.py...
-wmic process where "name='python.exe' and commandline like '%%sync_client.py%%'" call terminate >nul 2>&1
-wmic process where "name='wscript.exe' and commandline like '%%run_hidden.vbs%%'" call terminate >nul 2>&1
+call :kill_sync
 echo [OK] Da tat!
 if "%CMD%"=="" pause
 goto end
@@ -117,3 +115,13 @@ start cmd /k "python sync_client.py"
 goto end
 
 :end
+exit /b 0
+
+:: Tắt mọi tiến trình sync_client.py / run_hidden.vbs đang chạy.
+:: Dùng PowerShell (Get-CimInstance) thay cho wmic: wmic đã bị gỡ trên Windows 11 24H2 nên lệnh cũ
+:: thất bại mà không báo gì -> bản cũ vẫn chạy, bản mới tự thoát vì khoá 1 tiến trình -> update không có tác dụng.
+:kill_sync
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -match 'sync_client\.py|run_hidden\.vbs') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+:: Chờ tiến trình cũ nhả khoá (cổng 49512) trước khi bật lại
+timeout /t 2 /nobreak >nul
+exit /b 0

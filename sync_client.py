@@ -13,6 +13,7 @@ import io
 import threading
 import shutil
 import uuid
+from urllib.parse import quote
 
 # --- SINGLE-INSTANCE LOCK (SOCKET MUTEX) ---
 _lock_socket = None
@@ -128,7 +129,9 @@ ARCHIVE_FOLDER = os.path.join(BASE_DIR, BRANCH_ID, ROOM_ID)
 UPLOAD_WORKERS = max(1, int(config.get("upload_workers", 3)))
 # Chu kỳ quét lại thư mục (giây): bắt các file watchdog bỏ sót và thử lại file upload lỗi
 RESCAN_INTERVAL = max(10, int(config.get("rescan_interval", 30)))
-IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.cr2', '.raw', '.webp')
+# Chỉ đồng bộ ảnh trình duyệt hiển thị được. File RAW (.cr2/.nef/.arw/.raw...) KHÔNG upload:
+# web không hiển thị được (ô ảnh hỏng) và server ký URL upload với kiểu image/jpeg.
+IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp')
 LOG_FILE = os.path.join(BASE_DIR, "sync_client.log")
 
 class _Tee:
@@ -225,6 +228,15 @@ def save_processed_files():
 processed_files = load_processed_files()
 processed_files_lock = threading.Lock()
 
+def prune_processed_files():
+    """Bỏ các file đã bị xoá khỏi máy khỏi danh sách đã xử lý, để file này không phình mãi theo thời gian."""
+    with processed_files_lock:
+        missing = [p for p in processed_files if not os.path.exists(p)]
+        if missing:
+            processed_files.difference_update(missing)
+            save_processed_files()
+    return len(missing)
+
 # File đang nằm trong hàng đợi hoặc đang upload (chống xếp hàng trùng)
 queued_files = set()
 # File upload lỗi: abs_path -> (số lần lỗi, thời điểm được thử lại)
@@ -292,6 +304,11 @@ def http():
         _thread_local.session = s
     return s
 
+def url_segment(value):
+    """Mã hoá 1 đoạn đường dẫn URL. Tên thư mục có '#', '?', '%' mà không mã hoá sẽ làm URL bị cắt
+    (vd 'khach #3' thành 'khach ') -> ảnh lên R2 nhưng server ghi nhận sai phiên, web hiện ảnh hỏng."""
+    return quote(str(value), safe='')
+
 def server_headers():
     return {'Authorization': f"Bearer {PASSWORD}"} if PASSWORD else {}
 
@@ -352,7 +369,7 @@ def make_thumbnail(file_path):
         img.save(thumb_io, format="WEBP", quality=QUALITY, method=3)
         return thumb_io.getvalue()
 
-def process_and_upload(file_path, room_id, session_id):
+def process_and_upload(file_path, room_id, session_id, seq=None):
     """Trả về True nếu file đã được xử lý xong (hoặc không cần xử lý nữa), False nếu cần thử lại sau."""
     abs_path = norm_path(file_path)
     if is_file_processed(file_path):
@@ -415,7 +432,9 @@ def process_and_upload(file_path, room_id, session_id):
             log(f"    [CẢNH BÁO] {tag} Upload thumbnail thất bại (ảnh gốc vẫn OK).")
 
     # ── BƯỚC 5: Báo server. Nếu server không ghi nhận, ảnh sẽ KHÔNG hiện trên web -> phải thử lại ──
-    notify_url = f"{SERVER_URL}/api/notify-r2-upload/{BRANCH_ID}/{room_id}/{session_id}"
+    if seq is not None:
+        order_wait_turn(session_id, seq)  # giữ đúng thứ tự ảnh trên web
+    notify_url = f"{SERVER_URL}/api/notify-r2-upload/{url_segment(BRANCH_ID)}/{url_segment(room_id)}/{url_segment(session_id)}"
     if post_json_with_retry(notify_url, {"filename": filename}, f"{tag} Thông báo server") is None:
         return False
     if thumb_ok:
@@ -433,6 +452,39 @@ def process_and_upload(file_path, room_id, session_id):
     mark_processed(abs_path)
     log(f"    [OK] {tag} Hoàn tất.")
     return True
+
+# --- GIỮ ĐÚNG THỨ TỰ ẢNH ---
+# Upload lên R2 chạy song song (nhanh), nhưng bước báo server (quyết định thứ tự ảnh trên web)
+# chạy theo đúng thứ tự file được phát hiện trong từng phiên. Không có bước này, 3 luồng song song
+# làm ảnh hiện lộn xộn (01, 03, 02...). Chờ tối đa ORDER_WAIT giây để 1 file lỗi không chặn cả phiên.
+ORDER_WAIT = 60
+_order_cv = threading.Condition()
+_order_next_seq = {}     # session -> số thứ tự sẽ cấp tiếp
+_order_pending = {}      # session -> các số thứ tự chưa xong
+
+def order_ticket(session_id):
+    with _order_cv:
+        seq = _order_next_seq.get(session_id, 0)
+        _order_next_seq[session_id] = seq + 1
+        _order_pending.setdefault(session_id, set()).add(seq)
+        return seq
+
+def order_wait_turn(session_id, seq):
+    deadline = time.time() + ORDER_WAIT
+    with _order_cv:
+        while True:
+            pending = _order_pending.get(session_id, set())
+            if not any(s < seq for s in pending):
+                return
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            _order_cv.wait(timeout=min(remaining, 1.0))
+
+def order_done(session_id, seq):
+    with _order_cv:
+        _order_pending.get(session_id, set()).discard(seq)
+        _order_cv.notify_all()
 
 # --- HÀNG ĐỢI + NHIỀU WORKER ---
 upload_queue = Queue()
@@ -458,7 +510,8 @@ def enqueue_file(file_path):
         if fail and time.time() < fail[1]:
             return False
         queued_files.add(abs_path)
-    upload_queue.put((file_path, ROOM_ID, session_for(file_path)))
+    session_id = session_for(file_path)
+    upload_queue.put((file_path, ROOM_ID, session_id, order_ticket(session_id)))
     return True
 
 def worker_loop():
@@ -466,14 +519,15 @@ def worker_loop():
         item = upload_queue.get()
         if item is None:
             break
-        file_path, room_id, session_id = item
+        file_path, room_id, session_id, seq = item
         abs_path = norm_path(file_path)
         ok = False
         try:
-            ok = process_and_upload(file_path, room_id, session_id)
+            ok = process_and_upload(file_path, room_id, session_id, seq)
         except Exception as e:
             log(f"    [LỖI] Xử lý thất bại {file_path}: {e}")
         finally:
+            order_done(session_id, seq)
             with queue_state_lock:
                 queued_files.discard(abs_path)
                 if ok:
@@ -494,7 +548,8 @@ def scan_existing_files(verbose=True):
         if is_inside_folder(root, ARCHIVE_FOLDER):
             dirs[:] = []
             continue
-        for file in files:
+        dirs.sort()
+        for file in sorted(files):
             if enqueue_file(os.path.join(root, file)):
                 count_queued += 1
 
@@ -543,6 +598,9 @@ if __name__ == "__main__":
     observer.start()
 
     # 5. Quét các file đã có sẵn + quét lại định kỳ
+    removed = prune_processed_files()
+    if removed:
+        log(f"[*] Đã dọn {removed} file không còn trên máy khỏi processed_files.json.")
     scan_existing_files()
     threading.Thread(target=rescan_loop, name="rescan", daemon=True).start()
 
