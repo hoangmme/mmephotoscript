@@ -13,6 +13,8 @@ import io
 import threading
 import shutil
 import uuid
+import re
+import unicodedata
 from urllib.parse import quote
 
 # --- SINGLE-INSTANCE LOCK (SOCKET MUTEX) ---
@@ -171,6 +173,9 @@ if __name__ == "__main__":
     sys.stdout = _Tee(sys.stdout, LOG_FILE)
     sys.stderr = sys.stdout
 
+# Thư mục chụp có sẵn từ trước hay vừa được tạo mới (ổ ngoài/ổ mạng chưa kết nối -> tạo rỗng).
+# Chỉ dọn processed_files.json khi thư mục có sẵn, tránh xoá nhầm cả danh sách rồi tải lại toàn bộ ảnh.
+WATCH_FOLDER_EXISTED = os.path.isdir(WATCH_FOLDER)
 if not os.path.exists(WATCH_FOLDER):
     os.makedirs(WATCH_FOLDER)
     print(f"[*] Đã tạo thư mục theo dõi: {WATCH_FOLDER}")
@@ -229,9 +234,13 @@ processed_files = load_processed_files()
 processed_files_lock = threading.Lock()
 
 def prune_processed_files():
-    """Bỏ các file đã bị xoá khỏi máy khỏi danh sách đã xử lý, để file này không phình mãi theo thời gian."""
+    """Bỏ các file đã bị xoá khỏi máy khỏi danh sách đã xử lý, để file này không phình mãi theo thời gian.
+    Chỉ dọn file nằm trong thư mục chụp, và chỉ khi thư mục chụp có sẵn từ trước khi script chạy."""
+    if not WATCH_FOLDER_EXISTED:
+        return 0
     with processed_files_lock:
-        missing = [p for p in processed_files if not os.path.exists(p)]
+        missing = [p for p in processed_files
+                   if is_inside_folder(p, WATCH_FOLDER) and not os.path.exists(p)]
         if missing:
             processed_files.difference_update(missing)
             save_processed_files()
@@ -494,7 +503,9 @@ upload_queue = Queue()
 
 def session_for(file_path):
     parts = os.path.normpath(os.path.relpath(file_path, WATCH_FOLDER)).split(os.sep)
-    return parts[0] if len(parts) >= 2 else "default"
+    # Chuẩn hoá Unicode NFC: cùng một tên tiếng Việt gõ bằng bảng mã "dựng sẵn" hay "tổ hợp"
+    # vẫn ra đúng một phiên trên server (server so sánh tên phiên theo từng byte)
+    return unicodedata.normalize('NFC', parts[0]) if len(parts) >= 2 else "default"
 
 def enqueue_file(file_path):
     """Thêm file vào hàng đợi nếu chưa xử lý, chưa nằm trong hàng đợi và không đang trong thời gian chờ thử lại."""
@@ -513,8 +524,10 @@ def enqueue_file(file_path):
         if fail and time.time() < fail[1]:
             return False
         queued_files.add(abs_path)
-    session_id = session_for(file_path)
-    upload_queue.put((file_path, ROOM_ID, session_id, order_ticket(session_id)))
+        # Cấp số thứ tự và xếp hàng trong cùng một khoá: watchdog và luồng quét định kỳ có thể cùng thêm
+        # file của một phiên; nếu tách rời, file số lớn có thể vào hàng trước file số nhỏ.
+        session_id = session_for(file_path)
+        upload_queue.put((file_path, ROOM_ID, session_id, order_ticket(session_id)))
     return True
 
 def worker_loop():
@@ -543,18 +556,36 @@ def worker_loop():
                     log(f"    [THỬ LẠI] {os.path.basename(file_path)}: lỗi lần {count}, sẽ thử lại sau {delay}s.")
             upload_queue.task_done()
 
+def natural_key(name):
+    """'ảnh_2' đứng trước 'ảnh_10' (so số theo giá trị, không theo từng ký tự)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', name)]
+
+def capture_order_key(file_path):
+    """Thứ tự chụp = thời điểm ảnh được ghi (mtime). Chép file sang thư mục khác vẫn giữ mtime gốc
+    của máy ảnh. Trùng thời điểm (chụp liên tiếp trong cùng 1 giây) thì xếp theo số trong tên file."""
+    try:
+        mtime = int(os.path.getmtime(file_path))
+    except OSError:
+        mtime = 0
+    return (mtime, natural_key(os.path.basename(file_path)))
+
 def scan_existing_files(verbose=True):
     if verbose:
         log(f"[*] Đang quét tất cả thư mục & thư mục con trong {WATCH_FOLDER}...")
-    count_queued = 0
+    found = []
     for root, dirs, files in os.walk(WATCH_FOLDER):
         if is_inside_folder(root, ARCHIVE_FOLDER):
             dirs[:] = []
             continue
-        dirs.sort()
-        for file in sorted(files):
-            if enqueue_file(os.path.join(root, file)):
-                count_queued += 1
+        found.extend(os.path.join(root, f) for f in files)
+
+    # Xếp theo phiên, rồi theo thứ tự chụp. Không sắp theo chữ cái: tên kiểu "_1, _2 ... _10"
+    # sẽ ra "_1, _10, _11 ... _2".
+    found.sort(key=lambda p: (session_for(p), capture_order_key(p)))
+    count_queued = 0
+    for file_path in found:
+        if enqueue_file(file_path):
+            count_queued += 1
 
     if count_queued > 0:
         log(f"[*] Đã thêm {count_queued} file cần đồng bộ vào hàng đợi.")
