@@ -15,22 +15,283 @@ import shutil
 import uuid
 import re
 import unicodedata
+import subprocess
 from urllib.parse import quote
 
-# --- SINGLE-INSTANCE LOCK (SOCKET MUTEX) ---
+# --- SINGLE-INSTANCE LOCK (SOCKET MUTEX) + IPC GỌI CỬA SỔ CŨ LÊN ---
+# Cổng khoá vừa để chặn chạy trùng, vừa là kênh để lần chạy sau hỏi bản đang chạy:
+# "cửa sổ terminal của bạn là cái nào?" rồi đưa cửa sổ đó lên trước màn hình.
+LOCK_PORT = 49512
+WINDOW_TITLE_PREFIX = "LL PHOTOBOOTH SYNC CLIENT"
+CONSOLE_TITLE = WINDOW_TITLE_PREFIX
 _lock_socket = None
 
-def ensure_single_instance(port=49512):
+# ---- Win32 helpers (chỉ dùng ctypes có sẵn, không cần pywin32) ----
+_win32 = None
+
+def _get_win32():
+    """Khai báo kiểu tham số Win32 một lần (bắt buộc trên Python 64-bit để HWND không bị cắt)."""
+    global _win32
+    if _win32 is not None or os.name != 'nt':
+        return _win32
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL('user32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    HWND = wintypes.HWND
+    kernel32.GetConsoleWindow.restype = HWND
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    kernel32.SetConsoleTitleW.argtypes = [wintypes.LPCWSTR]
+    for name, args, res in [
+        ("IsWindow", [HWND], wintypes.BOOL),
+        ("IsWindowVisible", [HWND], wintypes.BOOL),
+        ("IsIconic", [HWND], wintypes.BOOL),
+        ("ShowWindow", [HWND, ctypes.c_int], wintypes.BOOL),
+        ("SetForegroundWindow", [HWND], wintypes.BOOL),
+        ("BringWindowToTop", [HWND], wintypes.BOOL),
+        ("GetForegroundWindow", [], HWND),
+        ("GetWindow", [HWND, wintypes.UINT], HWND),
+        ("GetWindowThreadProcessId", [HWND, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD),
+        ("AttachThreadInput", [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL], wintypes.BOOL),
+        ("GetWindowTextLengthW", [HWND], ctypes.c_int),
+        ("GetWindowTextW", [HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int),
+        ("keybd_event", [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_void_p], None),
+    ]:
+        fn = getattr(user32, name)
+        fn.argtypes = args
+        fn.restype = res
+    _win32 = (ctypes, wintypes, user32, kernel32)
+    return _win32
+
+def _get_console_hwnd():
+    """HWND cửa sổ console của tiến trình hiện tại (0 nếu không có / không phải Windows)."""
+    try:
+        w = _get_win32()
+        return (w[3].GetConsoleWindow() or 0) if w else 0
+    except Exception:
+        return 0
+
+def _visible_console_window(hwnd):
+    """Trả về cửa sổ thật người dùng nhìn thấy ứng với console hwnd.
+    - CMD/PowerShell (conhost): chính là hwnd.
+    - Windows Terminal: hwnd là cửa sổ giả (ẩn), cửa sổ thật là 'owner' của nó."""
+    w = _get_win32()
+    if not w or not hwnd:
+        return 0
+    user32 = w[2]
+    if not user32.IsWindow(hwnd):
+        return 0
+    if not user32.IsWindowVisible(hwnd):
+        owner = user32.GetWindow(hwnd, 4)  # GW_OWNER
+        if owner and user32.IsWindowVisible(owner):
+            return owner
+    return hwnd
+
+def _own_console_visible():
+    """Lần chạy này có cửa sổ cho người dùng thấy không? (chạy ẩn qua run_hidden.vbs thì không)."""
+    if os.name == 'nt':
+        try:
+            w = _get_win32()
+            target = _visible_console_window(_get_console_hwnd())
+            return bool(target and w[2].IsWindowVisible(target))
+        except Exception:
+            return False
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
+
+def set_console_title(title):
+    """Đặt tiêu đề cửa sổ terminal để dễ nhận ra (và để tìm lại cửa sổ theo tiêu đề)."""
+    if os.name == 'nt':
+        try:
+            _get_win32()[3].SetConsoleTitleW(title)
+        except Exception:
+            pass
+    else:
+        try:
+            out = sys.__stdout__
+            if out and out.isatty():
+                out.write(f"\033]0;{title}\007")
+                out.flush()
+        except Exception:
+            pass
+
+def _find_windows_by_title(fragment, exclude=()):
+    """Tìm các cửa sổ đang hiện có tiêu đề chứa `fragment` (dự phòng khi không lấy được HWND)."""
+    w = _get_win32()
+    if not w:
+        return []
+    ctypes, wintypes, user32, _ = w
+    found = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def _cb(hwnd, _lparam):
+        try:
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length and user32.IsWindowVisible(hwnd) and hwnd not in exclude:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                if fragment in buf.value:
+                    found.append(hwnd)
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    return found
+
+def _bring_window_to_front_windows(hwnd):
+    """Bung cửa sổ (nếu đang thu nhỏ/ẩn) và đưa lên trước màn hình.
+    Windows chặn 'cướp focus', nên gắn tạm luồng nhập liệu vào cửa sổ đang foreground (AttachThreadInput)."""
+    w = _get_win32()
+    if not w or not hwnd:
+        return False
+    _, _, user32, kernel32 = w
+    if not user32.IsWindow(hwnd):
+        return False
+
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+    elif not user32.IsWindowVisible(hwnd):
+        user32.ShowWindow(hwnd, 5)   # SW_SHOW (cửa sổ đang bị ẩn do chạy ngầm qua VBS)
+
+    def _try_focus():
+        fg = user32.GetForegroundWindow()
+        cur_tid = kernel32.GetCurrentThreadId()
+        fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        attached = False
+        if fg_tid and fg_tid != cur_tid:
+            attached = bool(user32.AttachThreadInput(cur_tid, fg_tid, True))
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(cur_tid, fg_tid, False)
+        return user32.GetForegroundWindow() == hwnd
+
+    if _try_focus():
+        return True
+    # Dự phòng: gõ phím Alt ảo để Windows cho phép đổi foreground. Chỉ làm khi cửa sổ của chính
+    # lần chạy này đang ở trước, để không bấm nhầm Alt vào phần mềm chụp ảnh.
+    if _own_console_visible():
+        user32.keybd_event(0x12, 0, 0, None)   # VK_MENU down
+        user32.keybd_event(0x12, 0, 2, None)   # VK_MENU up (KEYEVENTF_KEYUP)
+        if _try_focus():
+            return True
+    # Không giành được focus thì ít nhất cửa sổ đã được bung ra / hiện lên
+    return bool(user32.IsWindowVisible(hwnd))
+
+def _bring_terminal_to_front_macos(pid):
+    """macOS: tìm tab Terminal.app đang chạy PID cũ (theo tty) và đưa lên trước."""
+    try:
+        tty = subprocess.run(["ps", "-o", "tty=", "-p", str(int(pid))],
+                             capture_output=True, text=True, timeout=3).stdout.strip()
+        if not tty or tty.startswith("?"):
+            return False
+        tty_path = tty if tty.startswith("/dev/") else "/dev/" + tty
+        script = f'''
+if application "Terminal" is running then
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is "{tty_path}" then
+          set selected of t to true
+          set index of w to 1
+          activate
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end tell
+end if
+return "notfound"
+'''
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=5)
+        return res.stdout.strip() == "ok"
+    except Exception:
+        return False
+
+def _serve_focus_requests(sock):
+    """Bản đang chạy: trả lời lần chạy sau thông tin cửa sổ terminal của mình."""
+    while True:
+        try:
+            conn, _ = sock.accept()
+        except OSError:
+            break
+        try:
+            with conn:
+                conn.settimeout(2)
+                req = conn.recv(64).strip()
+                info = {"pid": os.getpid(), "hwnd": _get_console_hwnd() or 0, "title": CONSOLE_TITLE}
+                conn.sendall(json.dumps(info).encode("utf-8"))
+                if req == b"FOCUS":
+                    _log = globals().get("log", print)
+                    _log("[*] Có lần chạy mới -> đã đưa cửa sổ này lên trước. "
+                         "Muốn ẩn thì THU NHỎ (minimize), ĐỪNG ĐÓNG: đóng cửa sổ sẽ dừng đồng bộ ảnh.")
+        except Exception:
+            pass
+
+def _focus_existing_instance():
+    """Lần chạy sau: hỏi bản đang chạy rồi đưa cửa sổ terminal của nó lên trước. Trả về True nếu thành công."""
+    info = {}
+    try:
+        with socket.create_connection(("127.0.0.1", LOCK_PORT), timeout=2) as c:
+            c.settimeout(2)
+            c.sendall(b"FOCUS\n")
+            chunks = []
+            while True:
+                part = c.recv(4096)
+                if not part:
+                    break
+                chunks.append(part)
+        info = json.loads(b"".join(chunks).decode("utf-8") or "{}")
+    except Exception:
+        info = {}   # Bản cũ (chưa có IPC) không trả lời -> dùng tìm theo tiêu đề
+
+    if os.name == 'nt':
+        target = _visible_console_window(int(info.get("hwnd") or 0))
+        if target and _bring_window_to_front_windows(target):
+            return True
+        own = _visible_console_window(_get_console_hwnd())
+        for hwnd in _find_windows_by_title(WINDOW_TITLE_PREFIX, exclude=(own,)):
+            if _bring_window_to_front_windows(hwnd):
+                return True
+        return False
+    if sys.platform == 'darwin' and info.get("pid"):
+        return _bring_terminal_to_front_macos(info["pid"])
+    return False
+
+def ensure_single_instance(port=LOCK_PORT):
     """Đảm bảo chỉ có duy nhất 1 tiến trình sync_client chạy ngầm.
-    Tránh trường hợp người dùng click mở nhiều lần gây đơ máy và xung đột file."""
+    Tránh trường hợp người dùng click mở nhiều lần gây đơ máy và xung đột file.
+    Lần chạy sau sẽ không chạy thêm mà đưa cửa sổ terminal của bản đang chạy lên trước màn hình."""
     global _lock_socket
     try:
         _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         _lock_socket.bind(("127.0.0.1", port))
+        _lock_socket.listen(5)
     except (socket.error, OSError):
-        print("\n[CẢNH BÁO] Đã có một tiến trình sync_client.py đang chạy ngầm trên máy này!")
-        print("           Không khởi động thêm tiến trình mới để tránh quá tải và đơ máy.\n")
+        try:
+            _lock_socket.close()
+        except Exception:
+            pass
+        print("\n[CẢNH BÁO] Đã có một tiến trình sync_client.py đang chạy trên máy này!")
+        print("           Không khởi động thêm tiến trình mới để tránh quá tải và đơ máy.")
+        # Chạy ẩn (Startup / mmephoto start) thì không bật cửa sổ đè lên phần mềm chụp ảnh
+        if not _own_console_visible():
+            sys.exit(0)
+        if _focus_existing_instance():
+            print("[OK] Đã đưa cửa sổ của tiến trình đang chạy lên trước màn hình.\n")
+            time.sleep(1)
+        else:
+            print("[!] Không tìm thấy cửa sổ của tiến trình đang chạy (có thể đang chạy ngầm từ bản cũ).")
+            print("    Dùng 'mmephoto stop' rồi chạy lại nếu muốn xem log trực tiếp.\n")
+            time.sleep(4)
         sys.exit(0)
+    threading.Thread(target=_serve_focus_requests, args=(_lock_socket,),
+                     name="focus-ipc", daemon=True).start()
 
 def set_low_process_priority():
     """Hạ độ ưu tiên CPU trên Windows (BELOW_NORMAL) để không làm giật chuột hay đơ phần mềm chụp ảnh."""
@@ -114,6 +375,11 @@ def load_config():
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
         return json.load(f)
 
+if __name__ == "__main__":
+    # Khóa đơn tiến trình NGAY ĐẦU (trước khi đọc config / ghi log): lần chạy sau chỉ
+    # đưa cửa sổ của bản đang chạy lên trước rồi thoát, không đụng gì tới file.
+    ensure_single_instance()
+
 config = load_config()
 
 SERVER_URL = config["server_url"].rstrip('/')
@@ -170,6 +436,8 @@ class _Tee:
                 pass
 
 if __name__ == "__main__":
+    CONSOLE_TITLE = f"{WINDOW_TITLE_PREFIX} - {BRANCH_ID} / {ROOM_ID}"
+    set_console_title(CONSOLE_TITLE)
     sys.stdout = _Tee(sys.stdout, LOG_FILE)
     sys.stderr = sys.stdout
 
@@ -616,8 +884,7 @@ class PhotoHandler(FileSystemEventHandler):
             enqueue_file(event.dest_path)
 
 if __name__ == "__main__":
-    # 1. Khóa đơn tiến trình (ngăn chặn chạy 2-3 instance song song)
-    ensure_single_instance()
+    # 1. Khóa đơn tiến trình: đã chạy ở đầu file (trước load_config)
 
     # 2. Hạ độ ưu tiên CPU để máy tính không bị đơ giật ứng dụng chụp ảnh
     set_low_process_priority()
