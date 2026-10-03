@@ -9,7 +9,8 @@
   - Giữ script nhẹ và chạy mượt mà, không giật lag phần mềm chụp ảnh của booth.
 
 - **Status:**
-  - Done: Triển khai thành công tính năng "chạy lần 2 tự đưa cửa sổ terminal của instance cũ lên trước màn hình" trong `sync_client.py`. Đã commit và push đồng bộ lên cả nhánh `fix/sync-client` và nhánh `main` (commit `9814b61`). Các máy client booth đã có thể nhận bản cập nhật này qua lệnh `mmephoto update`.
+  - Done: Triển khai thành công tính năng "chạy lần 2 tự đưa cửa sổ terminal của instance cũ lên trước màn hình" trong `sync_client.py` (commit `9814b61`).
+  - Done: Sửa lỗi `mmephoto stop` bị lặp vô tận trên Windows (commit `eb9fd83`): thêm `.gitattributes` ép CRLF cho file `.bat`, sửa lệnh PowerShell lọc theo tên tiến trình (`python.exe`/`wscript.exe`), và cách ly tiến trình `git pull` khi update.
   - Current Focus: Kiểm thử và theo dõi thực tế trên máy Client Windows khi vận hành.
   - Lưu ý: Instance chạy ẩn (VBS) sẽ được hiển thị khi chạy lần 2 -> đóng cửa sổ này sẽ dừng đồng bộ (đã bổ sung cảnh báo hướng dẫn nhân viên thu nhỏ/minimize thay vì đóng). Lần chạy ngầm thứ 2 (Startup/`mmephoto start`) không tự kích hoạt cửa sổ để tránh đè lên app chụp ảnh.
 
