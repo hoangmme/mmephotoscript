@@ -72,13 +72,9 @@ goto end
 :update
 echo [*] Dang dung sync_client.py de update...
 call :kill_sync
-:: Dong nay giu nguyen do dai file de lenh 'mmephoto update' cua ban cu khong bi lech dong khi git pull                                                                                             
-
-echo [*] Dang lay code moi nhat tu Github...
-git pull
-
-echo [*] Cap nhat hoan tat! Khoi dong lai background service...
-goto start
+echo [*] Dang lay code moi nhat tu Github va khoi dong lai...
+cmd /c "git pull && call mmephoto.bat start"
+exit /b 0
 
 :reset
 echo [*] Dang dung service...
@@ -121,7 +117,7 @@ exit /b 0
 :: Dùng PowerShell (Get-CimInstance) thay cho wmic: wmic đã bị gỡ trên Windows 11 24H2 nên lệnh cũ
 :: thất bại mà không báo gì -> bản cũ vẫn chạy, bản mới tự thoát vì khoá 1 tiến trình -> update không có tác dụng.
 :kill_sync
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($_.CommandLine -match 'sync_client\.py|run_hidden\.vbs') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { ($_.Name -match '^(python|pythonw|wscript)\.exe$') -and ($_.CommandLine -match 'sync_client\.py|run_hidden\.vbs') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 :: Chờ tiến trình cũ nhả khoá (cổng 49512) trước khi bật lại
-timeout /t 2 /nobreak >nul
+timeout /t 2 /nobreak >nul 2>&1
 exit /b 0
