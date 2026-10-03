@@ -9,10 +9,9 @@
   - Giữ script nhẹ và chạy mượt mà, không giật lag phần mềm chụp ảnh của booth.
 
 - **Status:**
-  - Done: Pull code mới nhất (`1ac3c78`). Triển khai "lần chạy 2 đưa terminal cũ lên trước" trong `sync_client.py` (IPC qua cổng 49512, Win32 ctypes, fallback tìm theo tiêu đề, macOS Terminal.app). Khoá đơn tiến trình chuyển lên trước `load_config`. Đã test IPC trên macOS.
-  - Current Focus: Chờ test thực tế trên máy Windows (CMD, Windows Terminal, cửa sổ minimize, chạy ẩn VBS).
-  - Next: Commit/push khi người dùng xác nhận.
-  - Lưu ý: Instance chạy ẩn (VBS) sẽ bị hiện cửa sổ khi gọi lên -> đóng cửa sổ = dừng đồng bộ (đã in cảnh báo trong log). Lần chạy ẩn thứ 2 (Startup/`mmephoto start`) KHÔNG bật cửa sổ để không đè phần mềm chụp.
+  - Done: Triển khai thành công tính năng "chạy lần 2 tự đưa cửa sổ terminal của instance cũ lên trước màn hình" trong `sync_client.py`. Đã commit và push đồng bộ lên cả nhánh `fix/sync-client` và nhánh `main` (commit `9814b61`). Các máy client booth đã có thể nhận bản cập nhật này qua lệnh `mmephoto update`.
+  - Current Focus: Kiểm thử và theo dõi thực tế trên máy Client Windows khi vận hành.
+  - Lưu ý: Instance chạy ẩn (VBS) sẽ được hiển thị khi chạy lần 2 -> đóng cửa sổ này sẽ dừng đồng bộ (đã bổ sung cảnh báo hướng dẫn nhân viên thu nhỏ/minimize thay vì đóng). Lần chạy ngầm thứ 2 (Startup/`mmephoto start`) không tự kích hoạt cửa sổ để tránh đè lên app chụp ảnh.
 
 - **Flags (Drift/Critical/Entropy):**
   - Không có.
